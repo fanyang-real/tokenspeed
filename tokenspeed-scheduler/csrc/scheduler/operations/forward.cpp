@@ -1319,23 +1319,54 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // without (MinPrefillChunkTokens); the prefill phases spend the rest. Outside
 // mixed mode prefill work runs alone, and decodes get a round only when no
 // prefill scheduled.
+namespace {
+
+// Experimental: prefill-only rounds a fused, non-mixed scheduler may run while
+// decodes wait before it gives them a round (0 keeps prefill-first scheduling).
+std::int32_t MaxPrefillRoundsBeforeDecode() {
+    static const std::int32_t value = [] {
+        const char* raw = std::getenv("TOKENSPEED_MAX_PREFILL_ROUNDS_BEFORE_DECODE");
+        return raw == nullptr ? 0 : std::max(0, std::atoi(raw));
+    }();
+    return value;
+}
+
+}  // namespace
+
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
+    const std::int32_t max_prefill_rounds = MaxPrefillRoundsBeforeDecode();
+    const bool decode_turn = !config_.enable_mixed_prefill_decode && max_prefill_rounds > 0 &&
+                             prefill_rounds_since_decode_ >= max_prefill_rounds;
     if (config_.enable_mixed_prefill_decode) {
         const bool has_local_prefill = std::ranges::any_of(candidates, [](const Request* request) {
             return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
         });
         build.pending_prefill_reserve = has_local_prefill ? MinPrefillChunkTokens(coordinator_) : 0;
         scheduleDecodeBatch(feedback, build, candidates);
+    } else if (decode_turn) {
+        // Streaming decodes have waited behind max_prefill_rounds prefill
+        // rounds: this round is theirs, and prefill resumes on the next one.
+        scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    if (!(decode_turn && build.pushed_decode)) {
+        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    }
 
-    if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
+    if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill && !build.pushed_decode) {
         scheduleDecodeBatch(feedback, build, candidates);
+    }
+
+    if (!config_.enable_mixed_prefill_decode) {
+        if (build.pushed_decode) {
+            prefill_rounds_since_decode_ = 0;
+        } else if (build.pushed_prefill) {
+            ++prefill_rounds_since_decode_;
+        }
     }
 
     maybeRetractForCapacity(feedback, build, candidates, write_back_operations);

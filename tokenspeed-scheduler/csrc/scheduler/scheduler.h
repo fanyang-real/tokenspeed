@@ -461,6 +461,10 @@ private:
     // that schedules work or leaves work in flight.
     std::int64_t stalled_rounds_{0};
 
+    // Fused role outside mixed mode: consecutive rounds that ran prefill while
+    // decodes waited (buildFusedPlan); 0 after any round that decodes.
+    std::int32_t prefill_rounds_since_decode_{0};
+
     // Submission order -- the FIFO every scheduling phase walks, identical
     // on every rank because the mirrored schedulers receive identical
     // batches. The unique_ptr keeps each Request's address stable across
